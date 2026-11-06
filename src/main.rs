@@ -81,7 +81,7 @@ fn main() -> Result<()> {
 
         gb.run_frame()?;
 
-        // La PPU ne dessine pas encore : on affiche un écran uni (étape 5).
+        // La PPU ne dessine pas encore : on affiche un écran uni (étape 7).
         canvas.set_draw_color(Color::RGB(155, 188, 15));
         canvas.clear();
         canvas.present();

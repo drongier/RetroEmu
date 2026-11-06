@@ -1,7 +1,7 @@
 //! PPU (Picture Processing Unit) : la puce qui dessine l'écran.
 //!
 //! Pour l'instant elle ne dessine rien. Elle possède sa mémoire (VRAM, OAM) et ses registres,
-//! et fait avancer LY ligne par ligne. Le rendu des pixels arrive à l'étape 5.
+//! et fait avancer LY ligne par ligne. Le rendu des pixels arrive à l'étape 7.
 
 /// Durée d'une ligne, en dots (1 dot = 1 T-cycle).
 const DOTS_PER_LINE: u32 = 456;

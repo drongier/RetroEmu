@@ -110,6 +110,16 @@ impl Bus {
         self.if_ |= interrupt;
     }
 
+    /// Interruptions à la fois demandées (IF) et autorisées (IE) : celles qui peuvent sonner.
+    pub fn pending_interrupts(&self) -> u8 {
+        self.ie & self.if_ & 0x1F
+    }
+
+    /// Efface une demande dans IF : le CPU l'a prise en compte.
+    pub fn clear_interrupt(&mut self, interrupt: u8) {
+        self.if_ &= !interrupt;
+    }
+
     pub fn press_button(&mut self, button: Button) {
         if self.joypad.press(button) {
             self.request_interrupt(INT_JOYPAD);

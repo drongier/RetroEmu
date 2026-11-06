@@ -69,8 +69,19 @@ mod tests {
     #[test]
     fn une_erreur_du_cpu_remonte() {
         let mut rom = vec![0; 0x8000];
-        rom[0x0100] = 0xC3; // JP : pas encore supporté
+        rom[0x0100] = 0xD3; // opcode inexistant sur le SM83
         let mut gb = GameBoy::new(Cartridge::from_bytes(rom).unwrap());
         assert!(gb.run_frame().is_err());
+    }
+
+    #[test]
+    fn l_entry_point_classique_tourne_sans_erreur() {
+        // NOP ; JP 0x0150 : le début de presque tous les jeux.
+        let mut rom = vec![0; 0x8000];
+        rom[0x0100..0x0104].copy_from_slice(&[0x00, 0xC3, 0x50, 0x01]);
+        let mut gb = GameBoy::new(Cartridge::from_bytes(rom).unwrap());
+        for _ in 0..60 {
+            gb.run_frame().unwrap(); // une seconde d'émulation
+        }
     }
 }
