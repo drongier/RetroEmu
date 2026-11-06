@@ -48,6 +48,11 @@ impl GameBoy {
     pub fn release(&mut self, button: Button) {
         self.bus.release_button(button);
     }
+
+    /// Octets envoyés sur le port série depuis le dernier appel (les tests Blargg y écrivent).
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        self.bus.take_serial_output()
+    }
 }
 
 #[cfg(test)]

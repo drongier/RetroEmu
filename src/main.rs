@@ -6,6 +6,7 @@ mod joypad;
 mod ppu;
 mod timer;
 
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -25,13 +26,17 @@ const SCREEN_HEIGHT: u32 = 144;
 const SCALE: u32 = 4;
 /// Durée réelle d'une image : 70 224 cycles à 4 194 304 Hz ≈ 16,74 ms.
 const FRAME_DURATION: Duration = Duration::from_nanos(CYCLES_PER_FRAME as u64 * 1_000_000_000 / 4_194_304);
+/// En mode --headless, on abandonne après 2 minutes de temps émulé.
+const HEADLESS_MAX_FRAMES: u32 = 120 * 60;
 
 fn main() -> Result<()> {
     env_logger::init();
 
-    // ① Quelle ROM ?
-    let Some(rom_path) = std::env::args().nth(1) else {
-        bail!("usage : retro_emu <fichier.gb>");
+    // ① Quelle ROM, et quelles options ?
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let headless = args.iter().any(|arg| arg == "--headless");
+    let Some(rom_path) = args.iter().find(|arg| !arg.starts_with("--")) else {
+        bail!("usage : retro_emu [--headless] <fichier.gb>");
     };
 
     // ② Charger la cartouche et afficher son header.
@@ -45,6 +50,10 @@ fn main() -> Result<()> {
     println!("Checksum   : {}", if header.checksum_ok() { "OK" } else { "invalide" });
     let title = format!("RetroEmu - {}", header.title);
     let mut gb = GameBoy::new(cartridge);
+
+    if headless {
+        return run_headless(&mut gb);
+    }
 
     // ③ Ouvrir la fenêtre. SDL renvoie ses erreurs sous forme de String, d'où les map_err.
     let sdl = sdl2::init().map_err(|e| anyhow!(e))?;
@@ -80,6 +89,7 @@ fn main() -> Result<()> {
         }
 
         gb.run_frame()?;
+        print_serial(&mut gb, &mut Vec::new());
 
         // La PPU ne dessine pas encore : on affiche un écran uni (étape 7).
         canvas.set_draw_color(Color::RGB(155, 188, 15));
@@ -94,6 +104,38 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Mode sans fenêtre : fait tourner la ROM à pleine vitesse et affiche ce qu'elle envoie
+/// sur le port série. S'arrête quand un test Blargg écrit « Passed » ou « Failed ».
+fn run_headless(gb: &mut GameBoy) -> Result<()> {
+    let mut output = Vec::new();
+    for _ in 0..HEADLESS_MAX_FRAMES {
+        gb.run_frame()?;
+        print_serial(gb, &mut output);
+
+        let text = String::from_utf8_lossy(&output);
+        if text.contains("Passed") {
+            println!();
+            return Ok(());
+        }
+        if text.contains("Failed") {
+            println!();
+            bail!("le test a échoué");
+        }
+    }
+    bail!("aucun résultat après {} secondes émulées", HEADLESS_MAX_FRAMES / 60)
+}
+
+/// Affiche dans le terminal ce que la ROM vient d'envoyer sur le port série,
+/// et l'ajoute à `output`.
+fn print_serial(gb: &mut GameBoy, output: &mut Vec<u8>) {
+    let bytes = gb.take_serial_output();
+    if !bytes.is_empty() {
+        print!("{}", String::from_utf8_lossy(&bytes));
+        std::io::stdout().flush().ok(); // sans retour à la ligne, print! attend avant d'afficher
+        output.extend(bytes);
+    }
 }
 
 /// Touche du clavier → bouton de la Game Boy.

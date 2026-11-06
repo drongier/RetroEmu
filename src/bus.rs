@@ -29,6 +29,12 @@ pub struct Bus {
     ie: u8,
     /// Interruptions en attente (0xFF0F). `if` est un mot-clé de Rust, d'où le `_`.
     if_: u8,
+    /// Port série : l'octet à envoyer (0xFF01).
+    sb: u8,
+    /// Port série : contrôle (0xFF02). Bit 7 = transfert demandé, bit 0 = horloge interne.
+    sc: u8,
+    /// Octets envoyés sur le port série, en attendant que quelqu'un les lise.
+    serial_output: Vec<u8>,
 }
 
 impl Bus {
@@ -42,6 +48,9 @@ impl Bus {
             hram: [0; 0x7F],
             ie: 0,
             if_: 0,
+            sb: 0,
+            sc: 0,
+            serial_output: Vec::new(),
         }
     }
 
@@ -55,12 +64,14 @@ impl Bus {
             0xFE00..=0xFE9F => self.ppu.read(addr),
             0xFEA0..=0xFEFF => 0xFF, // zone inutilisable : rien n'est branché
             0xFF00 => self.joypad.read(),
+            0xFF01 => self.sb,
+            0xFF02 => self.sc | 0x7E, // les bits 1-6 n'existent pas
             0xFF04..=0xFF07 => self.timer.read(addr),
             0xFF0F => self.if_ | 0xE0, // les bits 5-7 n'existent pas et se lisent à 1
             0xFF40..=0xFF4B => self.ppu.read(addr),
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
             0xFFFF => self.ie,
-            _ => 0xFF, // registres pas encore émulés (son, port série...)
+            _ => 0xFF, // registres pas encore émulés (son...)
         }
     }
 
@@ -74,6 +85,8 @@ impl Bus {
             0xFE00..=0xFE9F => self.ppu.write(addr, value),
             0xFEA0..=0xFEFF => {}
             0xFF00 => self.joypad.write(value),
+            0xFF01 => self.sb = value,
+            0xFF02 => self.write_sc(value),
             0xFF04..=0xFF07 => self.timer.write(addr, value),
             0xFF0F => self.if_ = value & 0x1F,
             0xFF46 => self.dma(value), // avant la plage de la PPU : le premier bras qui correspond gagne
@@ -110,6 +123,11 @@ impl Bus {
         self.if_ |= interrupt;
     }
 
+    /// Récupère les octets envoyés sur le port série depuis le dernier appel.
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.serial_output)
+    }
+
     /// Interruptions à la fois demandées (IF) et autorisées (IE) : celles qui peuvent sonner.
     pub fn pending_interrupts(&self) -> u8 {
         self.ie & self.if_ & 0x1F
@@ -128,6 +146,20 @@ impl Bus {
 
     pub fn release_button(&mut self, button: Button) {
         self.joypad.release(button);
+    }
+
+    /// Écriture dans SC. Aucun câble n'est branché : quand la Game Boy donne le rythme
+    /// (bit 0) et lance un transfert (bit 7), l'octet de SB part dans `serial_output`,
+    /// et SB reçoit 0xFF, comme si le câble était vide.
+    /// Sur la vraie console, le transfert prend 4 096 T-cycles ; ici il est instantané.
+    fn write_sc(&mut self, value: u8) {
+        self.sc = value & 0x81;
+        if self.sc == 0x81 {
+            self.serial_output.push(self.sb);
+            self.sb = 0xFF;
+            self.sc &= 0x01; // bit 7 à 0 : « transfert terminé »
+            self.request_interrupt(INT_SERIAL);
+        }
     }
 
     /// DMA : copie 160 octets depuis l'adresse `value` × 0x100 vers l'OAM.
@@ -195,6 +227,17 @@ mod tests {
         bus.write8(0xFF46, 0xC1);
         assert_eq!(bus.read8(0xFE00), 0xAA);
         assert_eq!(bus.read8(0xFE9F), 0xBB);
+    }
+
+    #[test]
+    fn le_port_serie_envoie_un_octet() {
+        let mut bus = bus();
+        bus.write8(0xFF01, b'P');
+        bus.write8(0xFF02, 0x81); // « envoie, c'est moi qui donne le rythme »
+        assert_eq!(bus.take_serial_output(), b"P");
+        assert_eq!(bus.read8(0xFF02) & 0x80, 0); // transfert terminé
+        assert_eq!(bus.read8(0xFF0F) & INT_SERIAL, INT_SERIAL);
+        assert!(bus.take_serial_output().is_empty()); // déjà récupéré
     }
 
     #[test]

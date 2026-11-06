@@ -154,6 +154,9 @@ impl Cartridge {
 
         let mbc: Box<dyn Mbc> = match header.cartridge_type {
             0x00 => Box::new(RomOnly { rom }),
+            // Un MBC1 sans RAM de 32 Ko n'a qu'une banque à proposer : il se comporte comme
+            // une ROM ONLY. C'est le cas des tests Blargg. Le vrai MBC1 arrive à l'étape 10.
+            0x01 if rom.len() == 0x8000 => Box::new(RomOnly { rom }),
             other => bail!(
                 "cartouche \"{}\" de type {:#04X} ({}) pas encore supportée",
                 header.title,
@@ -226,5 +229,14 @@ mod tests {
     #[test]
     fn refuse_un_mbc_non_supporte() {
         assert!(Cartridge::from_bytes(fake_rom("ZELDA", 0x03)).is_err());
+    }
+
+    #[test]
+    fn accepte_un_mbc1_de_32_ko() {
+        let mut rom = fake_rom("BLARGG", 0x01);
+        rom.resize(0x8000, 0);
+        assert!(Cartridge::from_bytes(rom.clone()).is_ok());
+        rom.resize(0x10000, 0); // 64 Ko : il faudrait changer de banque
+        assert!(Cartridge::from_bytes(rom).is_err());
     }
 }
