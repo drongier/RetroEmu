@@ -1,0 +1,19 @@
+# Build Cargo
+/target/
+
+# ROMs et sauvegardes : jamais dans le dépôt (cf. sujet)
+*.gb
+*.gbc
+*.sav
+roms/
+test-roms/
+test-roms.zip
+
+# Sujet 42
+en.subject.pdf
+
+# Système et éditeurs
+.DS_Store
+.idea/
+.vscode/
+*.swp
