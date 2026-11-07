@@ -9,6 +9,7 @@ use crate::bus::Bus;
 use crate::cartridge::Cartridge;
 use crate::cpu::Cpu;
 use crate::joypad::Button;
+use crate::ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// T-cycles dans une image : 154 lignes × 456 dots.
 pub const CYCLES_PER_FRAME: u32 = 70_224;
@@ -66,6 +67,11 @@ impl GameBoy {
     /// Accès en lecture seule, pour le debugger.
     pub fn bus(&self) -> &Bus {
         &self.bus
+    }
+
+    /// L'écran : une teinte (0 = blanc à 3 = noir) par pixel, ligne après ligne.
+    pub fn framebuffer(&self) -> &[u8; SCREEN_WIDTH * SCREEN_HEIGHT] {
+        self.bus.framebuffer()
     }
 
     pub fn press(&mut self, button: Button) {

@@ -15,16 +15,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use sdl2::pixels::Color;
+use sdl2::pixels::PixelFormatEnum;
+use sdl2::render::Texture;
 
 use cartridge::Cartridge;
 use debugger::Debugger;
 use gameboy::{CYCLES_PER_FRAME, GameBoy};
 use joypad::Button;
 
-/// Taille de l'écran Game Boy, en pixels.
-const SCREEN_WIDTH: u32 = 160;
-const SCREEN_HEIGHT: u32 = 144;
+/// Taille de l'écran Game Boy, en pixels (SDL compte en u32, la PPU en usize).
+const SCREEN_WIDTH: u32 = ppu::SCREEN_WIDTH as u32;
+const SCREEN_HEIGHT: u32 = ppu::SCREEN_HEIGHT as u32;
+/// Les 4 verts de l'écran DMG, de la teinte 0 (la plus claire) à la teinte 3.
+const DMG_COLORS: [[u8; 3]; 4] = [[224, 248, 208], [136, 192, 112], [52, 104, 86], [8, 24, 32]];
 /// Agrandissement de la fenêtre : 160×144 est minuscule sur un écran moderne.
 const SCALE: u32 = 4;
 /// Durée réelle d'une image : 70 224 cycles à 4 194 304 Hz ≈ 16,74 ms.
@@ -68,6 +71,12 @@ fn main() -> Result<()> {
         .build()?;
     let mut canvas = window.into_canvas().build()?;
     let mut events = sdl.event_pump().map_err(|e| anyhow!(e))?;
+    // La texture : une image de 160 × 144 côté carte graphique, que SDL étire à la taille
+    // de la fenêtre. « Streaming » : on la remplit à nouveau à chaque image.
+    let texture_creator = canvas.texture_creator();
+    let mut texture =
+        texture_creator.create_texture_streaming(PixelFormatEnum::RGB24, SCREEN_WIDTH, SCREEN_HEIGHT)?;
+    let mut pixels = vec![0u8; (SCREEN_WIDTH * SCREEN_HEIGHT * 3) as usize];
 
     // En mode --debug : le debugger, et la boîte aux lettres où arrivent les lignes tapées.
     let mut debug_session = if debug {
@@ -123,9 +132,8 @@ fn main() -> Result<()> {
         }
         print_serial(&mut gb, &mut Vec::new());
 
-        // La PPU ne dessine pas encore : on affiche un écran uni (étape 7).
-        canvas.set_draw_color(Color::RGB(155, 188, 15));
-        canvas.clear();
+        draw_screen(gb.framebuffer(), &mut pixels, &mut texture)?;
+        canvas.copy(&texture, None, None).map_err(|e| anyhow!(e))?; // None, None : toute la texture, toute la fenêtre
         canvas.present();
 
         // On dort le temps qui reste pour tenir ~59,7 images par seconde.
@@ -135,6 +143,17 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Traduit les teintes de la PPU en couleurs RGB et les envoie dans la texture.
+fn draw_screen(framebuffer: &[u8], pixels: &mut [u8], texture: &mut Texture) -> Result<()> {
+    // chunks_exact_mut(3) découpe `pixels` en morceaux de 3 octets : un par pixel (R, G, B).
+    for (rgb, &shade) in pixels.chunks_exact_mut(3).zip(framebuffer) {
+        rgb.copy_from_slice(&DMG_COLORS[shade as usize]);
+    }
+    // Le dernier argument : combien d'octets fait une ligne (160 pixels × 3).
+    texture.update(None, pixels, SCREEN_WIDTH as usize * 3)?;
     Ok(())
 }
 

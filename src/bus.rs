@@ -6,7 +6,7 @@
 
 use crate::cartridge::Cartridge;
 use crate::joypad::{Button, Joypad};
-use crate::ppu::Ppu;
+use crate::ppu::{Ppu, SCREEN_HEIGHT, SCREEN_WIDTH};
 use crate::timer::Timer;
 
 /// Bits des registres IF et IE : un par source d'interruption.
@@ -121,6 +121,11 @@ impl Bus {
 
     pub fn request_interrupt(&mut self, interrupt: u8) {
         self.if_ |= interrupt;
+    }
+
+    /// La dernière image dessinée par la PPU.
+    pub fn framebuffer(&self) -> &[u8; SCREEN_WIDTH * SCREEN_HEIGHT] {
+        self.ppu.framebuffer()
     }
 
     /// Récupère les octets envoyés sur le port série depuis le dernier appel.
