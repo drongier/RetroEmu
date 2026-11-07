@@ -11,15 +11,38 @@ const DOTS_PER_LINE: u32 = 456;
 const LINES_PER_FRAME: u8 = 154;
 /// Première ligne de VBlank.
 const VBLANK_LINE: u8 = 144;
+/// Fin du mode 2 (OAM scan) et du mode 3 (dessin), en dots depuis le début de la ligne.
+/// Le mode 3 dure 172 dots au minimum ; on ignore les retards dus aux sprites et au scroll.
+const OAM_SCAN_END: u32 = 80;
+const DRAWING_END: u32 = OAM_SCAN_END + 172;
+
+/// Ce que fait la PPU en ce moment. La valeur de chaque mode est celle qu'affiche STAT.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    HBlank = 0,
+    VBlank = 1,
+    OamScan = 2,
+    Drawing = 3,
+}
+
+use crate::bus::{INT_STAT, INT_VBLANK};
 
 /// Taille de l'écran, en pixels.
 pub const SCREEN_WIDTH: usize = 160;
 pub const SCREEN_HEIGHT: usize = 144;
 
-/// Bits de LCDC (0xFF40) utiles au fond.
+/// Bits de LCDC (0xFF40).
+const LCDC_LCD_ON: u8 = 0x80; //     0 : écran éteint, la PPU est à l'arrêt
 const LCDC_BG_ENABLE: u8 = 0x01; // 0 : fond tout blanc
 const LCDC_BG_MAP: u8 = 0x08; //    0 : carte en 9800, 1 : carte en 9C00
 const LCDC_TILE_DATA: u8 = 0x10; // 0 : mode 8800 (numéros signés), 1 : mode 8000
+
+/// Bits de STAT (0xFF41).
+const STAT_LYC_EQUAL: u8 = 0x04; // LY == LYC (calculé par la PPU)
+const STAT_HBLANK_INT: u8 = 0x08; // « préviens-moi en mode 0 »
+const STAT_VBLANK_INT: u8 = 0x10; // « … en mode 1 »
+const STAT_OAM_INT: u8 = 0x20; //    « … en mode 2 »
+const STAT_LYC_INT: u8 = 0x40; //    « … quand LY == LYC »
 
 pub struct Ppu {
     /// 8 KiB de mémoire vidéo (0x8000–0x9FFF) : les tuiles et le plan du décor.
@@ -39,6 +62,8 @@ pub struct Ppu {
     obp1: u8,
     wy: u8,
     wx: u8,
+    /// Le fil STAT au dot précédent : l'interruption ne part que quand il passe de 0 à 1.
+    stat_line: bool,
     /// L'image en cours de dessin : une teinte (0 à 3) par pixel, ligne après ligne.
     framebuffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT],
 }
@@ -60,6 +85,7 @@ impl Ppu {
             obp1: 0,
             wy: 0,
             wx: 0,
+            stat_line: false,
             framebuffer: [0; SCREEN_WIDTH * SCREEN_HEIGHT],
         }
     }
@@ -70,21 +96,99 @@ impl Ppu {
     }
 
     /// Avance de `cycles` dots. Renvoie `true` quand l'écran entre en VBlank.
-    pub fn tick(&mut self, cycles: u32) -> bool {
-        let mut vblank = false;
-        self.dots += cycles;
-        while self.dots >= DOTS_PER_LINE {
-            self.dots -= DOTS_PER_LINE; // on garde le surplus pour la ligne suivante
-            // La ligne qui se termine était visible : on la dessine avant de passer à la suivante.
-            if self.ly < VBLANK_LINE {
-                self.render_line();
-            }
+    /// Avance de `cycles` dots. Renvoie les interruptions demandées, avec les bits de IF
+    /// (`INT_VBLANK`, `INT_STAT`), ou 0 si aucune.
+    pub fn tick(&mut self, cycles: u32) -> u8 {
+        if !self.lcd_on() {
+            return 0; // écran éteint : le temps passe, mais la PPU ne bouge pas
+        }
+        let mut interrupts = 0;
+        for _ in 0..cycles {
+            interrupts |= self.tick_dot();
+        }
+        interrupts
+    }
+
+    /// Avance d'un dot et réagit aux changements de mode et de ligne.
+    fn tick_dot(&mut self) -> u8 {
+        let mut interrupts = 0;
+        self.dots += 1;
+        if self.dots == DRAWING_END && self.ly < VBLANK_LINE {
+            self.render_line(); // fin du mode 3 : la ligne est dessinée, on entre en HBlank
+        }
+        if self.dots == DOTS_PER_LINE {
+            self.dots = 0;
             self.ly = (self.ly + 1) % LINES_PER_FRAME;
             if self.ly == VBLANK_LINE {
-                vblank = true;
+                interrupts |= INT_VBLANK;
             }
         }
-        vblank
+        // Front montant du fil STAT : il vient de passer de 0 à 1.
+        let line = self.stat_line();
+        if line && !self.stat_line {
+            interrupts |= INT_STAT;
+        }
+        self.stat_line = line;
+        interrupts
+    }
+
+    /// Le fil STAT : un OU entre les quatre sources que le jeu a activées dans STAT.
+    fn stat_line(&self) -> bool {
+        let mode_source = match self.mode() {
+            Mode::HBlank => STAT_HBLANK_INT,
+            Mode::VBlank => STAT_VBLANK_INT,
+            Mode::OamScan => STAT_OAM_INT,
+            Mode::Drawing => 0, // le mode 3 n'a pas de source
+        };
+        let lyc_source = self.ly == self.lyc && self.stat & STAT_LYC_INT != 0;
+        self.stat & mode_source != 0 || lyc_source
+    }
+
+    /// Le mode se déduit de la position dans l'image : pas besoin de le stocker.
+    fn mode(&self) -> Mode {
+        if !self.lcd_on() {
+            Mode::HBlank // écran éteint : STAT affiche le mode 0
+        } else if self.ly >= VBLANK_LINE {
+            Mode::VBlank
+        } else if self.dots < OAM_SCAN_END {
+            Mode::OamScan
+        } else if self.dots < DRAWING_END {
+            Mode::Drawing
+        } else {
+            Mode::HBlank
+        }
+    }
+
+    /// Le CPU peut toucher la VRAM sauf pendant le dessin (mode 3).
+    fn vram_accessible(&self) -> bool {
+        self.mode() != Mode::Drawing
+    }
+
+    /// Le CPU peut toucher l'OAM en HBlank et en VBlank (modes 0 et 1) : le bit 1 du mode à 0.
+    fn oam_accessible(&self) -> bool {
+        matches!(self.mode(), Mode::HBlank | Mode::VBlank)
+    }
+
+    /// Écriture du DMA dans l'OAM : le DMA a son propre accès, il n'est jamais bloqué.
+    pub fn write_oam_dma(&mut self, index: usize, value: u8) {
+        self.oam[index] = value;
+    }
+
+    fn lcd_on(&self) -> bool {
+        self.lcdc & LCDC_LCD_ON != 0
+    }
+
+    /// Écrit LCDC. Éteindre l'écran arrête la PPU au début de la ligne 0 et blanchit l'image ;
+    /// au rallumage, elle repart de là.
+    fn write_lcdc(&mut self, value: u8) {
+        let was_on = self.lcd_on();
+        self.lcdc = value;
+        if was_on && !self.lcd_on() {
+            self.ly = 0;
+            self.dots = 0;
+            self.stat_line = false;
+            self.framebuffer.fill(0);
+        }
     }
 
     /// Dessine la ligne LY dans le framebuffer.
@@ -136,10 +240,14 @@ impl Ppu {
 
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize],
-            0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],
+            // Pendant que la PPU s'en sert, le CPU lit 0xFF (le cas `_` plus bas).
+            0x8000..=0x9FFF if self.vram_accessible() => self.vram[(addr - 0x8000) as usize],
+            0xFE00..=0xFE9F if self.oam_accessible() => self.oam[(addr - 0xFE00) as usize],
             0xFF40 => self.lcdc,
-            0xFF41 => self.stat | 0x80, // le bit 7 n'existe pas et se lit à 1
+            0xFF41 => {
+                let lyc_equal = if self.ly == self.lyc { STAT_LYC_EQUAL } else { 0 };
+                0x80 | self.stat | lyc_equal | self.mode() as u8 // le bit 7 n'existe pas : lu à 1
+            }
             0xFF42 => self.scy,
             0xFF43 => self.scx,
             0xFF44 => self.ly,
@@ -155,10 +263,11 @@ impl Ppu {
 
     pub fn write(&mut self, addr: u16, value: u8) {
         match addr {
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = value,
-            0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize] = value,
-            0xFF40 => self.lcdc = value,
-            0xFF41 => self.stat = (self.stat & 0x07) | (value & 0x78), // bits 0-2 en lecture seule
+            // Pendant que la PPU s'en sert, l'écriture est perdue (le cas `_` plus bas).
+            0x8000..=0x9FFF if self.vram_accessible() => self.vram[(addr - 0x8000) as usize] = value,
+            0xFE00..=0xFE9F if self.oam_accessible() => self.oam[(addr - 0xFE00) as usize] = value,
+            0xFF40 => self.write_lcdc(value),
+            0xFF41 => self.stat = value & 0x78, // le jeu n'écrit que les bits 3-6 ; 0-2 viennent de la PPU
             0xFF42 => self.scy = value,
             0xFF43 => self.scx = value,
             0xFF44 => {} // LY est en lecture seule : c'est la PPU qui le fait avancer
@@ -195,8 +304,8 @@ mod tests {
     #[test]
     fn vblank_a_la_ligne_144_puis_retour_a_0() {
         let mut ppu = Ppu::new();
-        assert!(!ppu.tick(143 * 456));
-        assert!(ppu.tick(456));
+        assert_eq!(ppu.tick(143 * 456), 0);
+        assert_eq!(ppu.tick(456), INT_VBLANK);
         assert_eq!(ppu.read(0xFF44), 144);
         ppu.tick(10 * 456);
         assert_eq!(ppu.read(0xFF44), 0);
@@ -205,6 +314,7 @@ mod tests {
     #[test]
     fn vram_et_oam_gardent_les_valeurs() {
         let mut ppu = Ppu::new();
+        ppu.tick(252); // HBlank : VRAM et OAM libres
         ppu.write(0x8000, 0x12);
         ppu.write(0x9FFF, 0x34);
         ppu.write(0xFE00, 0x56);
@@ -285,19 +395,162 @@ mod tests {
     }
 
     #[test]
-    fn chaque_ligne_est_dessinee_a_sa_fin() {
+    fn chaque_ligne_est_dessinee_a_la_fin_du_mode_3() {
         let mut ppu = Ppu::new();
         for addr in 0x8000..0x8010 {
             ppu.write(addr, 0xFF); // tuile 0 noire : toute la carte (que des 0) est noire
         }
-        ppu.tick(455);
-        assert_eq!(ppu.framebuffer()[0], 0); // la ligne 0 n'est pas finie : rien de dessiné
+        ppu.tick(251);
+        assert_eq!(ppu.framebuffer()[0], 0); // encore en mode 3 : rien de dessiné
         ppu.tick(1);
-        assert_eq!(ppu.framebuffer()[0], 3); // ligne 0 terminée : dessinée
+        assert_eq!(ppu.framebuffer()[0], 3); // dot 252, fin du mode 3 : ligne 0 dessinée
         assert_eq!(ppu.framebuffer()[SCREEN_WIDTH], 0); // la ligne 1 pas encore
 
-        ppu.tick(143 * 456); // jusqu'au VBlank
+        ppu.tick(204 + 143 * 456); // jusqu'au VBlank
         assert!(ppu.framebuffer().iter().all(|&s| s == 3)); // les 144 lignes sont dessinées
+    }
+
+    /// Le mode lu dans STAT (bits 0-1).
+    fn stat_mode(ppu: &Ppu) -> u8 {
+        ppu.read(0xFF41) & 0x03
+    }
+
+    #[test]
+    fn les_modes_d_une_ligne_puis_le_vblank() {
+        let mut ppu = Ppu::new();
+        assert_eq!(stat_mode(&ppu), 2); // dot 0 : OAM scan
+        ppu.tick(79);
+        assert_eq!(stat_mode(&ppu), 2);
+        ppu.tick(1);
+        assert_eq!(stat_mode(&ppu), 3); // dot 80 : dessin
+        ppu.tick(172);
+        assert_eq!(stat_mode(&ppu), 0); // dot 252 : HBlank
+        ppu.tick(204);
+        assert_eq!(stat_mode(&ppu), 2); // ligne 1, dot 0 : on recommence
+        ppu.tick(143 * 456);
+        assert_eq!(stat_mode(&ppu), 1); // ligne 144 : VBlank, quel que soit le dot
+        ppu.tick(300);
+        assert_eq!(stat_mode(&ppu), 1);
+    }
+
+    #[test]
+    fn le_jeu_ne_peut_pas_changer_le_mode() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xFF45, 5); // LYC ≠ LY : le bit 2 reste à 0
+        ppu.write(0xFF41, 0xFF);
+        assert_eq!(ppu.read(0xFF41), 0xFA); // 1 | bits 3-6 du jeu | bit 2 à 0 | mode 2
+    }
+
+    #[test]
+    fn stat_signale_ly_egal_lyc() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xFF45, 2); // LYC
+        assert_eq!(ppu.read(0xFF41) & STAT_LYC_EQUAL, 0); // LY = 0
+        ppu.tick(2 * 456);
+        assert_eq!(ppu.read(0xFF41) & STAT_LYC_EQUAL, STAT_LYC_EQUAL); // LY = 2
+        ppu.tick(456);
+        assert_eq!(ppu.read(0xFF41) & STAT_LYC_EQUAL, 0); // LY = 3
+    }
+
+    /// Avance de `dots` dots, un par un, et compte les interruptions STAT.
+    fn count_stat_interrupts(ppu: &mut Ppu, dots: u32) -> u32 {
+        (0..dots).filter(|_| ppu.tick(1) & INT_STAT != 0).count() as u32
+    }
+
+    #[test]
+    fn interruption_lyc_une_fois_par_image() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xFF45, 100);
+        ppu.write(0xFF41, STAT_LYC_INT);
+        assert_eq!(count_stat_interrupts(&mut ppu, 100 * 456 - 1), 0);
+        assert_eq!(count_stat_interrupts(&mut ppu, 1), 1); // LY passe à 100
+        // Le fil reste à 1 pendant toute la ligne 100 : pas d'autre sonnerie.
+        assert_eq!(count_stat_interrupts(&mut ppu, 154 * 456 - 1), 0);
+        assert_eq!(count_stat_interrupts(&mut ppu, 1), 1); // image suivante
+    }
+
+    #[test]
+    fn interruption_hblank_a_chaque_ligne_visible() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xFF41, STAT_HBLANK_INT);
+        assert_eq!(count_stat_interrupts(&mut ppu, 154 * 456), 144); // rien pendant le VBlank
+    }
+
+    #[test]
+    fn deux_sources_collees_ne_sonnent_qu_une_fois() {
+        // Le chronogramme de l'artefact : HBlank (bit 3) et OAM scan (bit 5).
+        let mut ppu = Ppu::new();
+        ppu.write(0xFF41, STAT_HBLANK_INT | STAT_OAM_INT);
+        assert_eq!(count_stat_interrupts(&mut ppu, 1), 1); // déjà en mode 2 : le fil monte
+        // Sur deux lignes : 3 → 0 sonne deux fois, 0 → 2 jamais (le fil reste à 1).
+        assert_eq!(count_stat_interrupts(&mut ppu, 2 * 456), 2);
+    }
+
+    #[test]
+    fn vram_bloquee_pendant_le_dessin() {
+        let mut ppu = Ppu::new();
+        ppu.write(0x8000, 0x12); // mode 2 : la VRAM est libre
+        ppu.tick(80); // mode 3
+        assert_eq!(ppu.read(0x8000), 0xFF); // lecture bloquée
+        ppu.write(0x8000, 0x34); // écriture perdue
+        ppu.tick(172); // mode 0
+        assert_eq!(ppu.read(0x8000), 0x12);
+    }
+
+    #[test]
+    fn oam_bloquee_pendant_le_scan_et_le_dessin() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xFE00, 0x12); // mode 2 : perdue
+        assert_eq!(ppu.read(0xFE00), 0xFF);
+        ppu.tick(80); // mode 3
+        ppu.write(0xFE00, 0x34); // perdue aussi
+        ppu.tick(172); // mode 0
+        assert_eq!(ppu.read(0xFE00), 0x00);
+        ppu.write(0xFE00, 0x56);
+        ppu.tick(204 + 143 * 456); // VBlank
+        assert_eq!(ppu.read(0xFE00), 0x56);
+    }
+
+    #[test]
+    fn ecran_eteint_tout_est_libre() {
+        let mut ppu = Ppu::new();
+        ppu.write(0xFF40, 0x11); // écran éteint
+        ppu.write(0xFE00, 0x56);
+        assert_eq!(ppu.read(0xFE00), 0x56);
+    }
+
+    #[test]
+    fn eteindre_l_ecran_arrete_la_ppu() {
+        let mut ppu = Ppu::new();
+        ppu.tick(50 * 456 + 100); // ligne 50, en plein mode 3
+        ppu.write(0xFF40, 0x11); // LCDC bit 7 = 0
+        assert_eq!(ppu.read(0xFF44), 0);
+        assert_eq!(stat_mode(&ppu), 0);
+        assert_eq!(ppu.tick(200 * 456), 0); // une image entière passe : rien ne bouge
+        assert_eq!(ppu.read(0xFF44), 0);
+    }
+
+    #[test]
+    fn rallumer_repart_du_debut_de_la_ligne_0() {
+        let mut ppu = Ppu::new();
+        ppu.tick(50 * 456 + 100);
+        ppu.write(0xFF40, 0x11); // éteint
+        ppu.write(0xFF40, 0x91); // rallumé
+        assert_eq!(stat_mode(&ppu), 2); // dot 0 de la ligne 0 : OAM scan
+        ppu.tick(456);
+        assert_eq!(ppu.read(0xFF44), 1);
+    }
+
+    #[test]
+    fn ecran_eteint_tout_blanc() {
+        let mut ppu = Ppu::new();
+        for addr in 0x8000..0x8010 {
+            ppu.write(addr, 0xFF); // tuile 0 noire
+        }
+        ppu.tick(154 * 456);
+        assert!(ppu.framebuffer().iter().all(|&s| s == 3));
+        ppu.write(0xFF40, 0x11);
+        assert!(ppu.framebuffer().iter().all(|&s| s == 0));
     }
 
     #[test]

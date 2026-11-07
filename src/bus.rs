@@ -111,9 +111,8 @@ impl Bus {
 
     /// Avance toutes les puces de `cycles` T-cycles et range leurs interruptions dans IF.
     pub fn tick(&mut self, cycles: u32) {
-        if self.ppu.tick(cycles) {
-            self.request_interrupt(INT_VBLANK);
-        }
+        let ppu_interrupts = self.ppu.tick(cycles); // VBlank et/ou STAT, déjà au format de IF
+        self.request_interrupt(ppu_interrupts);
         if self.timer.tick(cycles) {
             self.request_interrupt(INT_TIMER);
         }
@@ -173,7 +172,7 @@ impl Bus {
         let source = (value as u16) << 8;
         for i in 0..0xA0 {
             let byte = self.read8(source + i);
-            self.ppu.write(0xFE00 + i, byte);
+            self.ppu.write_oam_dma(i as usize, byte);
         }
     }
 }
@@ -229,7 +228,8 @@ mod tests {
         let mut bus = bus();
         bus.write8(0xC100, 0xAA);
         bus.write8(0xC19F, 0xBB);
-        bus.write8(0xFF46, 0xC1);
+        bus.write8(0xFF46, 0xC1); // en mode 2 : le CPU n'a pas accès à l'OAM, le DMA si
+        bus.tick(252); // HBlank : le CPU peut relire l'OAM
         assert_eq!(bus.read8(0xFE00), 0xAA);
         assert_eq!(bus.read8(0xFE9F), 0xBB);
     }
