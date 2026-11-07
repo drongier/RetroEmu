@@ -3,7 +3,7 @@
 //! Elle possède sa mémoire (VRAM, OAM) et ses registres, fait avancer LY ligne par ligne,
 //! et dessine chaque ligne dans un framebuffer de 160 × 144 teintes (0 = blanc, 3 = noir).
 //!
-//! Pour l'instant seul le fond est dessiné. La window et les sprites viendront ensuite.
+//! Pour l'instant le fond et la window sont dessinés. Les sprites viendront ensuite.
 
 /// Durée d'une ligne, en dots (1 dot = 1 T-cycle).
 const DOTS_PER_LINE: u32 = 456;
@@ -36,6 +36,11 @@ const LCDC_LCD_ON: u8 = 0x80; //     0 : écran éteint, la PPU est à l'arrêt
 const LCDC_BG_ENABLE: u8 = 0x01; // 0 : fond tout blanc
 const LCDC_BG_MAP: u8 = 0x08; //    0 : carte en 9800, 1 : carte en 9C00
 const LCDC_TILE_DATA: u8 = 0x10; // 0 : mode 8800 (numéros signés), 1 : mode 8000
+const LCDC_WINDOW_ENABLE: u8 = 0x20; // 1 : window affichée
+const LCDC_WINDOW_MAP: u8 = 0x40; // 0 : carte en 9800, 1 : carte en 9C00
+
+/// Au-delà, la window commence après le bord droit de l'écran (WX − 7 ≥ 160).
+const WX_OFF_SCREEN: u8 = 167;
 
 /// Bits de STAT (0xFF41).
 const STAT_LYC_EQUAL: u8 = 0x04; // LY == LYC (calculé par la PPU)
@@ -64,6 +69,10 @@ pub struct Ppu {
     wx: u8,
     /// Le fil STAT au dot précédent : l'interruption ne part que quand il passe de 0 à 1.
     stat_line: bool,
+    /// LY a atteint WY pendant cette image : la window peut apparaître.
+    window_y_reached: bool,
+    /// Compteur de lignes de la window : n'avance que sur les lignes où elle est dessinée.
+    window_line: u8,
     /// L'image en cours de dessin : une teinte (0 à 3) par pixel, ligne après ligne.
     framebuffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT],
 }
@@ -86,6 +95,8 @@ impl Ppu {
             wy: 0,
             wx: 0,
             stat_line: false,
+            window_y_reached: false,
+            window_line: 0,
             framebuffer: [0; SCREEN_WIDTH * SCREEN_HEIGHT],
         }
     }
@@ -121,6 +132,7 @@ impl Ppu {
             self.ly = (self.ly + 1) % LINES_PER_FRAME;
             if self.ly == VBLANK_LINE {
                 interrupts |= INT_VBLANK;
+                self.reset_window(); // la prochaine image repart de la ligne 0 de la window
             }
         }
         // Front montant du fil STAT : il vient de passer de 0 à 1.
@@ -187,32 +199,66 @@ impl Ppu {
             self.ly = 0;
             self.dots = 0;
             self.stat_line = false;
+            self.reset_window();
             self.framebuffer.fill(0);
         }
     }
 
+    fn reset_window(&mut self) {
+        self.window_y_reached = false;
+        self.window_line = 0;
+    }
+
     /// Dessine la ligne LY dans le framebuffer.
     fn render_line(&mut self) {
+        if self.ly == self.wy {
+            self.window_y_reached = true; // retenu jusqu'à la fin de l'image
+        }
+        let bg_enabled = self.lcdc & LCDC_BG_ENABLE != 0; // sur DMG : fond ET window
+        let window_shown = bg_enabled
+            && self.lcdc & LCDC_WINDOW_ENABLE != 0
+            && self.window_y_reached
+            && self.wx < WX_OFF_SCREEN;
+        // Colonne de l'écran où la window commence. En i16 : avec WX < 7, elle est négative.
+        let window_x = self.wx as i16 - 7;
+
         let start = self.ly as usize * SCREEN_WIDTH;
         for x in 0..SCREEN_WIDTH {
-            self.framebuffer[start + x] = if self.lcdc & LCDC_BG_ENABLE != 0 {
-                shade(self.bgp, self.background_color(x as u8))
+            let color = if window_shown && x as i16 >= window_x {
+                self.window_color((x as i16 - window_x) as u8)
             } else {
-                0 // fond désactivé : blanc, quelle que soit la palette
+                self.background_color(x as u8)
             };
+            // Fond désactivé : blanc, quelle que soit la palette.
+            self.framebuffer[start + x] = if bg_enabled { shade(self.bgp, color) } else { 0 };
+        }
+        if window_shown {
+            self.window_line += 1; // la window a été dessinée sur cette ligne
         }
     }
 
     /// Numéro de couleur (0 à 3) du fond au pixel `x` de la ligne LY.
     fn background_color(&self, x: u8) -> u8 {
-        // ① Où suis-je dans la carte ? Les u8 font le tour à 256 tout seuls.
+        // Où suis-je dans la carte ? Les u8 font le tour à 256 tout seuls.
         let bx = x.wrapping_add(self.scx);
         let by = self.ly.wrapping_add(self.scy);
-        // ② Quelle tuile ? La carte fait 32 cases de large.
         let map = if self.lcdc & LCDC_BG_MAP != 0 { 0x9C00 } else { 0x9800 };
-        let tile = self.vram_read(map + (by / 8) as u16 * 32 + (bx / 8) as u16);
-        // ③ et ④ Quelle ligne, quel pixel de la tuile ?
-        self.tile_pixel(tile, by % 8, bx % 8)
+        self.map_color(map, bx, by)
+    }
+
+    /// Numéro de couleur de la window à la colonne `wx` de la window (0 = son bord gauche).
+    /// Pas de scroll : sa ligne est donnée par son propre compteur.
+    fn window_color(&self, wx: u8) -> u8 {
+        let map = if self.lcdc & LCDC_WINDOW_MAP != 0 { 0x9C00 } else { 0x9800 };
+        self.map_color(map, wx, self.window_line)
+    }
+
+    /// Numéro de couleur au point (`x`, `y`) d'une carte de 32 × 32 tuiles.
+    fn map_color(&self, map: u16, x: u8, y: u8) -> u8 {
+        // Quelle tuile ? La carte fait 32 cases de large.
+        let tile = self.vram_read(map + (y / 8) as u16 * 32 + (x / 8) as u16);
+        // Quelle ligne, quel pixel de la tuile ?
+        self.tile_pixel(tile, y % 8, x % 8)
     }
 
     /// Adresse des 16 octets de la tuile `tile`, selon le mode choisi par LCDC.
@@ -551,6 +597,97 @@ mod tests {
         assert!(ppu.framebuffer().iter().all(|&s| s == 3));
         ppu.write(0xFF40, 0x11);
         assert!(ppu.framebuffer().iter().all(|&s| s == 0));
+    }
+
+    /// LCDC avec la window : écran, carte window en 9C00, window, mode 8000, fond.
+    const LCDC_WITH_WINDOW: u8 = 0xF1;
+
+    /// Tuile 1 : ligne 0 en couleur 3, ligne 1 en couleur 2, ligne 2 en couleur 1, le reste 0.
+    /// La carte du fond (9800) ne contient que la tuile 0, toute blanche.
+    fn window_test_ppu() -> Ppu {
+        let mut ppu = Ppu::new();
+        for (row, (low, high)) in [(0xFF, 0xFF), (0x00, 0xFF), (0xFF, 0x00)].into_iter().enumerate() {
+            ppu.write(0x8010 + row as u16 * 2, low);
+            ppu.write(0x8011 + row as u16 * 2, high);
+        }
+        ppu.write(0xFF47, 0xE4); // BGP : teinte = couleur
+        ppu.write(0xFF40, LCDC_WITH_WINDOW);
+        ppu
+    }
+
+    /// Teinte du pixel (x, y) de l'écran.
+    fn pixel(ppu: &Ppu, x: usize, y: usize) -> u8 {
+        ppu.framebuffer()[y * SCREEN_WIDTH + x]
+    }
+
+    #[test]
+    fn la_window_couvre_a_partir_de_wy_et_wx_moins_7() {
+        let mut ppu = window_test_ppu();
+        for addr in 0x9C00..0xA000 {
+            ppu.write(addr, 1); // toute la carte window : tuile 1
+        }
+        ppu.write(0xFF4A, 10); // WY
+        ppu.write(0xFF4B, 87); // WX : la window commence à x = 80
+        ppu.tick(11 * 456);
+        assert_eq!(pixel(&ppu, 100, 9), 0); // ligne 9 : au-dessus de WY, le fond
+        assert_eq!(pixel(&ppu, 79, 10), 0); // ligne 10, x = 79 : encore le fond
+        assert_eq!(pixel(&ppu, 80, 10), 3); // x = 80 : ligne 0 de la window
+        assert_eq!(pixel(&ppu, 159, 10), 3); // jusqu'au bord droit
+    }
+
+    #[test]
+    fn la_window_ne_defile_pas() {
+        let mut ppu = window_test_ppu();
+        ppu.write(0x9C00, 1); // seule la case (0, 0) de la carte window contient la tuile 1
+        ppu.write(0xFF42, 30); // SCY et SCX n'ont aucun effet sur la window
+        ppu.write(0xFF43, 50);
+        ppu.write(0xFF4A, 0);
+        ppu.write(0xFF4B, 7);
+        ppu.tick(456);
+        assert_eq!(pixel(&ppu, 0, 0), 3); // coin (0, 0) de la carte window
+        assert_eq!(pixel(&ppu, 7, 0), 3);
+        assert_eq!(pixel(&ppu, 8, 0), 0); // case (1, 0) : tuile 0
+    }
+
+    #[test]
+    fn le_compteur_de_la_window_saute_les_lignes_cachees() {
+        let mut ppu = window_test_ppu();
+        ppu.write(0x9C00, 1);
+        ppu.write(0xFF4B, 7);
+        ppu.tick(456); // ligne 0 : ligne 0 de la window
+        ppu.write(0xFF40, LCDC_WITH_WINDOW & !LCDC_WINDOW_ENABLE);
+        ppu.tick(456); // ligne 1 : window cachée
+        ppu.write(0xFF40, LCDC_WITH_WINDOW);
+        ppu.tick(456); // ligne 2
+        assert_eq!(pixel(&ppu, 0, 0), 3);
+        assert_eq!(pixel(&ppu, 0, 1), 0); // le fond
+        assert_eq!(pixel(&ppu, 0, 2), 2); // ligne 1 de la window, pas la 2 (LY − WY)
+
+        ppu.tick(151 * 456); // image suivante
+        assert_eq!(pixel(&ppu, 0, 0), 3); // le compteur est reparti de 0
+    }
+
+    #[test]
+    fn la_window_attend_que_ly_atteigne_wy() {
+        let mut ppu = window_test_ppu();
+        ppu.write(0x9C00, 1);
+        ppu.write(0xFF4A, 5);
+        ppu.write(0xFF4B, 7);
+        ppu.tick(2 * 456);
+        ppu.write(0xFF4A, 0); // trop tard : LY est déjà passé par 0
+        ppu.tick(456);
+        assert_eq!(pixel(&ppu, 0, 2), 0); // toujours le fond
+    }
+
+    #[test]
+    fn wx_167_cache_la_window() {
+        let mut ppu = window_test_ppu();
+        for addr in 0x9C00..0xA000 {
+            ppu.write(addr, 1);
+        }
+        ppu.write(0xFF4B, 167);
+        ppu.tick(456);
+        assert!(ppu.framebuffer()[..SCREEN_WIDTH].iter().all(|&s| s == 0));
     }
 
     #[test]
