@@ -9,6 +9,7 @@
 mod alu;
 mod arith16;
 mod cb;
+mod disasm;
 mod interrupts;
 mod jumps;
 mod load;
@@ -18,9 +19,13 @@ mod stack;
 #[cfg(test)]
 mod test_utils;
 
+use std::fmt;
+
 use anyhow::{Result, bail};
 
 use crate::bus::Bus;
+
+pub use disasm::disassemble;
 
 /// Bits du registre F.
 const FLAG_Z: u8 = 0x80; // le résultat vaut zéro
@@ -167,6 +172,11 @@ impl Cpu {
         Ok(cycles)
     }
 
+    /// Adresse de la prochaine instruction.
+    pub fn pc(&self) -> u16 {
+        self.pc
+    }
+
     /// Lit l'octet pointé par PC, puis avance PC.
     fn fetch8(&mut self, bus: &Bus) -> u8 {
         let byte = bus.read8(self.pc);
@@ -186,6 +196,39 @@ impl Cpu {
     }
 }
 
+/// L'état des registres sur une ligne, pour le debugger :
+/// `A:01 F:B0 [Z-HC] B:00 C:13 D:00 E:D8 H:01 L:4D SP:FFFE PC:0100 IME:0`
+impl fmt::Display for Cpu {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Une lettre par drapeau levé, un tiret sinon.
+        let flag = |mask: u8, letter: char| if self.f & mask != 0 { letter } else { '-' };
+        write!(
+            f,
+            "A:{:02X} F:{:02X} [{}{}{}{}] B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} \
+             SP:{:04X} PC:{:04X} IME:{}",
+            self.a,
+            self.f,
+            flag(FLAG_Z, 'Z'),
+            flag(FLAG_N, 'N'),
+            flag(FLAG_H, 'H'),
+            flag(FLAG_C, 'C'),
+            self.b,
+            self.c,
+            self.d,
+            self.e,
+            self.h,
+            self.l,
+            self.sp,
+            self.pc,
+            self.ime as u8,
+        )?;
+        if self.halted {
+            write!(f, " HALT")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_utils::bus_with;
@@ -196,6 +239,15 @@ mod tests {
         let cpu = Cpu::new();
         assert_eq!(cpu.pc, 0x0100);
         assert_eq!(cpu.sp, 0xFFFE);
+    }
+
+    #[test]
+    fn affiche_les_registres_sur_une_ligne() {
+        let cpu = Cpu::new();
+        assert_eq!(
+            cpu.to_string(),
+            "A:01 F:B0 [Z-HC] B:00 C:13 D:00 E:D8 H:01 L:4D SP:FFFE PC:0100 IME:0"
+        );
     }
 
     #[test]

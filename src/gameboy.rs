@@ -16,8 +16,9 @@ pub const CYCLES_PER_FRAME: u32 = 70_224;
 pub struct GameBoy {
     cpu: Cpu,
     bus: Bus,
-    /// Cycles exécutés en trop à la fin de l'image précédente, déjà comptés pour la suivante.
-    surplus: u32,
+    /// Cycles déjà exécutés dans l'image en cours. Une image peut déborder un peu
+    /// (la dernière instruction finit après la limite) : ce surplus compte pour la suivante.
+    frame_cycles: u32,
 }
 
 impl GameBoy {
@@ -25,20 +26,46 @@ impl GameBoy {
         GameBoy {
             cpu: Cpu::new(),
             bus: Bus::new(cartridge),
-            surplus: 0,
+            frame_cycles: 0,
         }
     }
 
     /// Exécute une image complète (70 224 T-cycles), instruction par instruction.
     pub fn run_frame(&mut self) -> Result<()> {
-        let mut cycles = self.surplus;
-        while cycles < CYCLES_PER_FRAME {
-            let spent = self.cpu.step(&mut self.bus)?;
-            self.bus.tick(spent);
-            cycles += spent;
-        }
-        self.surplus = cycles - CYCLES_PER_FRAME;
+        self.run_frame_until(|_| false)?;
         Ok(())
+    }
+
+    /// Comme `run_frame`, mais s'arrête avant d'exécuter une instruction si `stop(pc)` répond
+    /// `true`. Renvoie `true` si on s'est arrêté en route ; l'appel suivant reprend l'image là
+    /// où elle en était.
+    pub fn run_frame_until(&mut self, stop: impl Fn(u16) -> bool) -> Result<bool> {
+        while self.frame_cycles < CYCLES_PER_FRAME {
+            if stop(self.cpu.pc()) {
+                return Ok(true);
+            }
+            self.step()?;
+        }
+        self.frame_cycles -= CYCLES_PER_FRAME;
+        Ok(false)
+    }
+
+    /// Exécute une seule instruction (ou un tour de sommeil, ou une interruption).
+    pub fn step(&mut self) -> Result<u32> {
+        let spent = self.cpu.step(&mut self.bus)?;
+        self.bus.tick(spent);
+        self.frame_cycles += spent;
+        Ok(spent)
+    }
+
+    /// Accès en lecture seule, pour le debugger.
+    pub fn cpu(&self) -> &Cpu {
+        &self.cpu
+    }
+
+    /// Accès en lecture seule, pour le debugger.
+    pub fn bus(&self) -> &Bus {
+        &self.bus
     }
 
     pub fn press(&mut self, button: Button) {
@@ -66,7 +93,7 @@ mod tests {
         let mut gb = GameBoy::new(Cartridge::from_bytes(vec![0; 0x8000]).unwrap());
         gb.run_frame().unwrap();
 
-        assert_eq!(gb.surplus, 0); // 70 224 / 4 tombe juste
+        assert_eq!(gb.frame_cycles, 0); // 70 224 / 4 tombe juste
         assert_eq!(gb.bus.read8(0xFF44), 0); // LY a fait le tour complet : 154 lignes
         assert_eq!(gb.bus.read8(0xFF0F) & INT_VBLANK, INT_VBLANK);
     }
@@ -77,6 +104,17 @@ mod tests {
         rom[0x0100] = 0xD3; // opcode inexistant sur le SM83
         let mut gb = GameBoy::new(Cartridge::from_bytes(rom).unwrap());
         assert!(gb.run_frame().is_err());
+    }
+
+    #[test]
+    fn s_arreter_au_milieu_d_une_image_puis_reprendre() {
+        let mut gb = GameBoy::new(Cartridge::from_bytes(vec![0; 0x8000]).unwrap()); // que des NOP
+        assert!(gb.run_frame_until(|pc| pc == 0x0110).unwrap());
+        assert_eq!(gb.cpu().pc(), 0x0110);
+        assert_eq!(gb.frame_cycles, 16 * 4); // 16 NOP exécutés
+
+        assert!(!gb.run_frame_until(|_| false).unwrap()); // finit la même image
+        assert_eq!(gb.frame_cycles, 0);
     }
 
     #[test]

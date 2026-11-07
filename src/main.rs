@@ -1,6 +1,7 @@
 mod bus;
 mod cartridge;
 mod cpu;
+mod debugger;
 mod gameboy;
 mod joypad;
 mod ppu;
@@ -8,6 +9,7 @@ mod timer;
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -16,6 +18,7 @@ use sdl2::keyboard::Keycode;
 use sdl2::pixels::Color;
 
 use cartridge::Cartridge;
+use debugger::Debugger;
 use gameboy::{CYCLES_PER_FRAME, GameBoy};
 use joypad::Button;
 
@@ -35,8 +38,9 @@ fn main() -> Result<()> {
     // ① Quelle ROM, et quelles options ?
     let args: Vec<String> = std::env::args().skip(1).collect();
     let headless = args.iter().any(|arg| arg == "--headless");
+    let debug = args.iter().any(|arg| arg == "--debug");
     let Some(rom_path) = args.iter().find(|arg| !arg.starts_with("--")) else {
-        bail!("usage : retro_emu [--headless] <fichier.gb>");
+        bail!("usage : retro_emu [--headless | --debug] <fichier.gb>");
     };
 
     // ② Charger la cartouche et afficher son header.
@@ -65,6 +69,16 @@ fn main() -> Result<()> {
     let mut canvas = window.into_canvas().build()?;
     let mut events = sdl.event_pump().map_err(|e| anyhow!(e))?;
 
+    // En mode --debug : le debugger, et la boîte aux lettres où arrivent les lignes tapées.
+    let mut debug_session = if debug {
+        let debugger = Debugger::new();
+        debugger.start(&gb);
+        print_prompt();
+        Some((debugger, spawn_command_reader()))
+    } else {
+        None
+    };
+
     // ④ La boucle principale : une image par tour.
     'running: loop {
         let frame_start = Instant::now();
@@ -88,7 +102,25 @@ fn main() -> Result<()> {
             }
         }
 
-        gb.run_frame()?;
+        match &mut debug_session {
+            None => gb.run_frame()?,
+            Some((debugger, commands)) => {
+                // On relève toutes les lignes arrivées depuis la dernière image, sans attendre.
+                loop {
+                    match commands.try_recv() {
+                        Ok(line) => {
+                            if !debugger.handle_line(&mut gb, &line) {
+                                break 'running;
+                            }
+                            print_prompt();
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break 'running, // Ctrl-D
+                    }
+                }
+                debugger.update(&mut gb)?;
+            }
+        }
         print_serial(&mut gb, &mut Vec::new());
 
         // La PPU ne dessine pas encore : on affiche un écran uni (étape 7).
@@ -125,6 +157,26 @@ fn run_headless(gb: &mut GameBoy) -> Result<()> {
         }
     }
     bail!("aucun résultat après {} secondes émulées", HEADLESS_MAX_FRAMES / 60)
+}
+
+/// Lance un thread qui lit le terminal ligne par ligne et dépose chaque ligne dans un canal.
+/// Lire le terminal bloque jusqu'à Entrée : c'est ce thread qui attend, jamais la fenêtre.
+fn spawn_command_reader() -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break; // le thread principal est parti : plus personne pour lire
+            }
+        }
+    });
+    receiver
+}
+
+fn print_prompt() {
+    print!("(debug) ");
+    std::io::stdout().flush().ok();
 }
 
 /// Affiche dans le terminal ce que la ROM vient d'envoyer sur le port série,
