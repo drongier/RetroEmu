@@ -38,6 +38,10 @@ pub struct Bus {
 }
 
 impl Bus {
+    pub fn cartridge(&self) -> &Cartridge {
+        &self.cartridge
+    }
+
     pub fn new(cartridge: Cartridge) -> Bus {
         Bus {
             cartridge,

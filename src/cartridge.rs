@@ -1,7 +1,10 @@
-//! Cartouche : lecture du fichier ROM, analyse du header et MBC.
+//! Cartouche : lecture du fichier ROM, analyse du header et choix du MBC.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+use crate::mbc::{Mbc, Mbc1, Mbc2, Mbc5, RomOnly};
 
 /// Informations lues dans le header de la ROM (0x0134–0x014F).
 #[derive(Debug, Clone)]
@@ -67,6 +70,11 @@ impl Header {
     }
 
     /// Le jeu sait-il utiliser les fonctions de la CGB ? (0x80 = compatible, 0xC0 = CGB uniquement)
+    /// La cartouche a-t-elle une pile pour garder sa RAM console éteinte ?
+    pub fn has_battery(&self) -> bool {
+        matches!(self.cartridge_type, 0x03 | 0x06 | 0x09 | 0x0D | 0x0F | 0x10 | 0x13 | 0x1B | 0x1E | 0x22 | 0xFF)
+    }
+
     pub fn supports_cgb(&self) -> bool {
         self.cgb_flag & 0x80 != 0
     }
@@ -95,50 +103,52 @@ impl Header {
     }
 }
 
-/// Ce que tout contrôleur de banques (MBC) doit savoir faire.
-///
-/// Le bus ne connaît que ce trait : il n'a pas besoin de savoir quel MBC
-/// se cache derrière pour lui transmettre les accès.
-pub trait Mbc {
-    /// Lecture dans 0x0000–0x7FFF.
-    fn read_rom(&self, addr: u16) -> u8;
-    /// Écriture dans 0x0000–0x7FFF : ne modifie jamais la ROM, ce sont des commandes pour le MBC.
-    fn write_rom(&mut self, addr: u16, value: u8);
-    /// Lecture dans 0xA000–0xBFFF.
-    fn read_ram(&self, addr: u16) -> u8;
-    /// Écriture dans 0xA000–0xBFFF.
-    fn write_ram(&mut self, addr: u16, value: u8);
-}
-
-/// Cartouche sans MBC : 32 KiB de ROM directement visibles, pas de RAM.
-struct RomOnly {
-    rom: Vec<u8>,
-}
-
-impl Mbc for RomOnly {
-    fn read_rom(&self, addr: u16) -> u8 {
-        self.rom.get(addr as usize).copied().unwrap_or(0xFF)
-    }
-
-    fn write_rom(&mut self, _addr: u16, _value: u8) {}
-
-    fn read_ram(&self, _addr: u16) -> u8 {
-        0xFF
-    }
-
-    fn write_ram(&mut self, _addr: u16, _value: u8) {}
-}
-
 pub struct Cartridge {
     pub header: Header,
     mbc: Box<dyn Mbc>,
+    /// Le fichier .sav, à côté de la ROM, pour les cartouches à pile qui ont de la RAM.
+    save_path: Option<PathBuf>,
 }
 
 impl Cartridge {
     pub fn load(path: &Path) -> Result<Cartridge> {
         let rom = std::fs::read(path)
             .with_context(|| format!("impossible de lire la ROM {}", path.display()))?;
-        Cartridge::from_bytes(rom)
+        let mut cartridge = Cartridge::from_bytes(rom)?;
+        if cartridge.header.has_battery() && !cartridge.mbc.ram().is_empty() {
+            let save_path = path.with_extension("sav"); // zelda.gb → zelda.sav
+            cartridge.load_save(&save_path)?;
+            cartridge.save_path = Some(save_path);
+        }
+        Ok(cartridge)
+    }
+
+    /// Recopie le fichier .sav dans la RAM. Pas de fichier : c'est une première partie.
+    /// Un fichier illisible est une erreur : continuer écraserait la sauvegarde à la fermeture.
+    fn load_save(&mut self, path: &Path) -> Result<()> {
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("impossible de lire la sauvegarde {}", path.display()));
+            }
+        };
+        let ram = self.mbc.ram_mut();
+        if data.len() != ram.len() {
+            log::warn!("{} fait {} octets au lieu de {}", path.display(), data.len(), ram.len());
+        }
+        let size = data.len().min(ram.len());
+        ram[..size].copy_from_slice(&data[..size]);
+        Ok(())
+    }
+
+    /// Écrit la RAM dans le fichier .sav. Sans pile, il n'y a rien à faire.
+    pub fn save(&self) -> Result<()> {
+        if let Some(path) = &self.save_path {
+            std::fs::write(path, self.mbc.ram())
+                .with_context(|| format!("impossible d'écrire la sauvegarde {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn from_bytes(rom: Vec<u8>) -> Result<Cartridge> {
@@ -153,10 +163,11 @@ impl Cartridge {
         }
 
         let mbc: Box<dyn Mbc> = match header.cartridge_type {
-            0x00 => Box::new(RomOnly { rom }),
-            // Un MBC1 sans RAM de 32 Ko n'a qu'une banque à proposer : il se comporte comme
-            // une ROM ONLY. C'est le cas des tests Blargg. Le vrai MBC1 arrive à l'étape 10.
-            0x01 if rom.len() == 0x8000 => Box::new(RomOnly { rom }),
+            0x00 => Box::new(RomOnly::new(rom)),
+            0x01..=0x03 => Box::new(Mbc1::new(rom, header.ram_size())), // MBC1, +RAM, +BATTERY
+            0x05 | 0x06 => Box::new(Mbc2::new(rom)), // MBC2, +BATTERY : sa RAM est dans la puce
+            // MBC5, +RAM, +BATTERY, et les mêmes avec vibreur (« rumble »), qu'on ignore.
+            0x19..=0x1E => Box::new(Mbc5::new(rom, header.ram_size())),
             other => bail!(
                 "cartouche \"{}\" de type {:#04X} ({}) pas encore supportée",
                 header.title,
@@ -165,7 +176,7 @@ impl Cartridge {
             ),
         };
 
-        Ok(Cartridge { header, mbc })
+        Ok(Cartridge { header, mbc, save_path: None })
     }
 
     pub fn read_rom(&self, addr: u16) -> u8 {
@@ -212,31 +223,71 @@ mod tests {
     }
 
     #[test]
-    fn rom_only_lit_la_rom_et_ignore_les_ecritures() {
-        let mut rom = fake_rom("TEST", 0x00);
-        rom[0x4000] = 0x42;
-        let mut cart = Cartridge::from_bytes(rom).unwrap();
-        cart.write_rom(0x4000, 0x99);
-        assert_eq!(cart.read_rom(0x4000), 0x42);
-        assert_eq!(cart.read_ram(0xA000), 0xFF);
-    }
-
-    #[test]
     fn refuse_un_fichier_trop_petit() {
         assert!(Cartridge::from_bytes(vec![0; 0x100]).is_err());
     }
 
     #[test]
     fn refuse_un_mbc_non_supporte() {
-        assert!(Cartridge::from_bytes(fake_rom("ZELDA", 0x03)).is_err());
+        assert!(Cartridge::from_bytes(fake_rom("POKEMON", 0x13)).is_err()); // MBC3 : hors sujet
     }
 
     #[test]
-    fn accepte_un_mbc1_de_32_ko() {
-        let mut rom = fake_rom("BLARGG", 0x01);
-        rom.resize(0x8000, 0);
-        assert!(Cartridge::from_bytes(rom.clone()).is_ok());
-        rom.resize(0x10000, 0); // 64 Ko : il faudrait changer de banque
-        assert!(Cartridge::from_bytes(rom).is_err());
+    fn choisit_le_mbc1() {
+        let mut rom = fake_rom("ZELDA", 0x03); // MBC1+RAM+BATTERY
+        rom[0x0149] = 0x03; // 32 Ko de RAM
+        rom.resize(0x10000, 0); // 64 Ko : 4 banques
+        rom[0x8000] = 0x42; // premier octet de la banque 2
+        let mut cart = Cartridge::from_bytes(rom).unwrap();
+        cart.write_rom(0x2000, 2);
+        assert_eq!(cart.read_rom(0x4000), 0x42);
+    }
+
+    /// Écrit une ROM MBC1+RAM+BATTERY (8 Ko de RAM) dans un dossier temporaire propre au test.
+    fn battery_rom_file(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("retroemu-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rom = fake_rom("ZELDA", 0x03);
+        rom[0x0149] = 0x02; // 8 Ko de RAM
+        let path = dir.join("zelda.gb");
+        std::fs::write(&path, rom).unwrap();
+        path
+    }
+
+    #[test]
+    fn la_ram_survit_dans_le_fichier_sav() {
+        let path = battery_rom_file("sav");
+        let mut cart = Cartridge::load(&path).unwrap();
+        cart.write_rom(0x0000, 0x0A); // active la RAM
+        cart.write_ram(0xA123, 0x42);
+        cart.save().unwrap();
+        assert!(path.with_extension("sav").exists());
+
+        let mut cart = Cartridge::load(&path).unwrap(); // « on rallume la console »
+        cart.write_rom(0x0000, 0x0A);
+        assert_eq!(cart.read_ram(0xA123), 0x42);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pas_de_sav_sans_pile() {
+        let path = battery_rom_file("sans-pile");
+        let mut rom = std::fs::read(&path).unwrap();
+        rom[0x0147] = 0x02; // MBC1+RAM, sans BATTERY
+        std::fs::write(&path, rom).unwrap();
+        Cartridge::load(&path).unwrap().save().unwrap();
+        assert!(!path.with_extension("sav").exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn un_sav_trop_court_remplit_le_debut() {
+        let path = battery_rom_file("court");
+        std::fs::write(path.with_extension("sav"), [1, 2, 3]).unwrap();
+        let mut cart = Cartridge::load(&path).unwrap();
+        cart.write_rom(0x0000, 0x0A);
+        assert_eq!([cart.read_ram(0xA000), cart.read_ram(0xA002), cart.read_ram(0xA003)], [1, 3, 0]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

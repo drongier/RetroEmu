@@ -7,6 +7,7 @@ mod font;
 mod gameboy;
 mod gui;
 mod joypad;
+mod mbc;
 mod ppu;
 mod timer;
 
@@ -59,8 +60,11 @@ impl App {
     }
 
     /// Remplace la partie en cours par la ROM `path`. En cas d'erreur (fichier illisible,
-    /// pas une ROM…), rien ne change : la partie en cours continue.
+    /// pas une ROM…), la partie en cours continue.
     fn load(&mut self, path: &Path) -> Result<()> {
+        // Sauvegarder d'abord : si on recharge le même jeu, la nouvelle cartouche doit
+        // lire le .sav à jour, pas celui du lancement précédent.
+        self.save();
         let cartridge = Cartridge::load(path)?;
         print_header(&cartridge);
         self.rom_name = Some(cartridge.header.title.clone());
@@ -72,6 +76,15 @@ impl App {
             self.last_dir = dir.to_path_buf();
         }
         Ok(())
+    }
+
+    /// Écrit le .sav de la partie en cours (seulement pour les cartouches à pile).
+    fn save(&self) {
+        if let Some(gb) = &self.gb {
+            if let Err(error) = gb.save() {
+                eprintln!("{error:#}");
+            }
+        }
     }
 
     /// Charge une ROM ; en cas d'échec, explique pourquoi dans le terminal.
@@ -146,6 +159,14 @@ impl App {
     }
 }
 
+impl Drop for App {
+    /// L'App disparaît à la fin de `main`, quelle qu'en soit la raison : Échap, la croix
+    /// de la fenêtre, ou une erreur remontée par `?`. Dans tous les cas, on sauvegarde.
+    fn drop(&mut self) {
+        self.save();
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -158,15 +179,17 @@ fn main() -> Result<()> {
         bail!("usage : retro_emu [--headless | --debug] <fichier.gb>");
     }
 
-    // ② Charger la cartouche, si on en a une.
+    // ② Les ROM de test tournent sans App : elles ne doivent pas laisser de .sav derrière elles.
+    if let (true, Some(path)) = (headless, rom_path) {
+        let cartridge = Cartridge::load(Path::new(path))?;
+        print_header(&cartridge);
+        return run_headless(&mut GameBoy::new(cartridge));
+    }
+
+    // Charger la cartouche, si on en a une.
     let mut app = App::new();
     if let Some(path) = rom_path {
         app.load(Path::new(path))?;
-    }
-    if headless {
-        if let Some(gb) = app.gb.as_mut() {
-            return run_headless(gb);
-        }
     }
 
     // ③ Ouvrir la fenêtre. SDL renvoie ses erreurs sous forme de String, d'où les map_err.
@@ -337,22 +360,44 @@ fn draw_screen(framebuffer: &[u8], pixels: &mut [u8], texture: &mut Texture) -> 
     Ok(())
 }
 
+/// Signal de fin des tests Mooneye sur le port série : la suite de Fibonacci si le test
+/// réussit, six fois 0x42 s'il échoue.
+const MOONEYE_PASSED: [u8; 6] = [3, 5, 8, 13, 21, 34];
+const MOONEYE_FAILED: [u8; 6] = [0x42; 6];
+
+/// Le verdict d'une ROM de test d'après ce qu'elle a envoyé sur le port série :
+/// `Some(true)` réussi, `Some(false)` échoué, `None` pas encore terminé.
+/// Blargg écrit « Passed » ou « Failed » en texte, Mooneye envoie 6 octets.
+fn test_verdict(output: &[u8]) -> Option<bool> {
+    // windows(n) : toutes les tranches de n octets consécutifs, pour chercher un motif.
+    let contains = |pattern: &[u8]| output.windows(pattern.len()).any(|window| window == pattern);
+    if contains(b"Passed") || contains(&MOONEYE_PASSED) {
+        Some(true)
+    } else if contains(b"Failed") || contains(&MOONEYE_FAILED) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Mode sans fenêtre : fait tourner la ROM à pleine vitesse et affiche ce qu'elle envoie
-/// sur le port série. S'arrête quand un test Blargg écrit « Passed » ou « Failed ».
+/// sur le port série. S'arrête dès que la ROM de test (Blargg ou Mooneye) donne son verdict.
 fn run_headless(gb: &mut GameBoy) -> Result<()> {
     let mut output = Vec::new();
     for _ in 0..HEADLESS_MAX_FRAMES {
         gb.run_frame()?;
         print_serial(gb, &mut output);
 
-        let text = String::from_utf8_lossy(&output);
-        if text.contains("Passed") {
-            println!();
-            return Ok(());
-        }
-        if text.contains("Failed") {
-            println!();
-            bail!("le test a échoué");
+        match test_verdict(&output) {
+            Some(true) => {
+                println!("\nTest réussi");
+                return Ok(());
+            }
+            Some(false) => {
+                println!();
+                bail!("le test a échoué");
+            }
+            None => {}
         }
     }
     bail!("aucun résultat après {} secondes émulées", HEADLESS_MAX_FRAMES / 60)
@@ -420,6 +465,16 @@ mod tests {
         // Au plus un seul dépassement de sleep (le dernier), pas 30 mis bout à bout.
         assert!(elapsed >= FRAME_DURATION * FRAMES);
         assert!(elapsed < FRAME_DURATION * FRAMES + Duration::from_millis(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn verdict_des_roms_de_test() {
+        assert_eq!(test_verdict(b"cpu_instrs\n\nPassed all tests"), Some(true));
+        assert_eq!(test_verdict(b"01-special\n\nFailed #2"), Some(false));
+        assert_eq!(test_verdict(&[3, 5, 8, 13, 21, 34]), Some(true));
+        assert_eq!(test_verdict(&[0x42; 6]), Some(false));
+        assert_eq!(test_verdict(&[3, 5, 8]), None); // pas encore fini
+        assert_eq!(test_verdict(b"Pass"), None);
     }
 
     #[test]

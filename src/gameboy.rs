@@ -31,6 +31,11 @@ impl GameBoy {
         }
     }
 
+    /// Écrit la RAM de la cartouche dans son fichier .sav, si elle a une pile.
+    pub fn save(&self) -> Result<()> {
+        self.bus.cartridge().save()
+    }
+
     /// Exécute une image complète (70 224 T-cycles), instruction par instruction.
     pub fn run_frame(&mut self) -> Result<()> {
         self.run_frame_until(|_| false)?;
