@@ -34,6 +34,8 @@ pub const SCREEN_HEIGHT: usize = 144;
 /// Bits de LCDC (0xFF40).
 const LCDC_LCD_ON: u8 = 0x80; //     0 : écran éteint, la PPU est à l'arrêt
 const LCDC_BG_ENABLE: u8 = 0x01; // 0 : fond tout blanc
+const LCDC_OBJ_ENABLE: u8 = 0x02; // 1 : sprites affichés
+const LCDC_OBJ_SIZE: u8 = 0x04; //   0 : sprites 8 × 8, 1 : sprites 8 × 16
 const LCDC_BG_MAP: u8 = 0x08; //    0 : carte en 9800, 1 : carte en 9C00
 const LCDC_TILE_DATA: u8 = 0x10; // 0 : mode 8800 (numéros signés), 1 : mode 8000
 const LCDC_WINDOW_ENABLE: u8 = 0x20; // 1 : window affichée
@@ -48,6 +50,26 @@ const STAT_HBLANK_INT: u8 = 0x08; // « préviens-moi en mode 0 »
 const STAT_VBLANK_INT: u8 = 0x10; // « … en mode 1 »
 const STAT_OAM_INT: u8 = 0x20; //    « … en mode 2 »
 const STAT_LYC_INT: u8 = 0x40; //    « … quand LY == LYC »
+
+/// Au plus 10 sprites par ligne : les suivants dans l'OAM sont ignorés.
+const MAX_SPRITES_PER_LINE: usize = 10;
+
+// Les bits des attributs d'un sprite (octet 3 de sa fiche).
+const ATTR_PALETTE: u8 = 0x10; //   0 : OBP0, 1 : OBP1
+const ATTR_FLIP_X: u8 = 0x20; //    miroir horizontal
+const ATTR_FLIP_Y: u8 = 0x40; //    miroir vertical
+const ATTR_BEHIND_BG: u8 = 0x80; // derrière les couleurs 1 à 3 du fond
+
+/// Une fiche de l'OAM (4 octets), telle qu'elle est écrite par le jeu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Sprite {
+    /// Ligne de l'écran + 16 : 16 veut dire « collé en haut ».
+    y: u8,
+    /// Colonne de l'écran + 8 : 8 veut dire « collé à gauche ».
+    x: u8,
+    tile: u8,
+    attrs: u8,
+}
 
 pub struct Ppu {
     /// 8 KiB de mémoire vidéo (0x8000–0x9FFF) : les tuiles et le plan du décor.
@@ -106,7 +128,6 @@ impl Ppu {
         &self.framebuffer
     }
 
-    /// Avance de `cycles` dots. Renvoie `true` quand l'écran entre en VBlank.
     /// Avance de `cycles` dots. Renvoie les interruptions demandées, avec les bits de IF
     /// (`INT_VBLANK`, `INT_STAT`), ou 0 si aucune.
     pub fn tick(&mut self, cycles: u32) -> u8 {
@@ -222,18 +243,84 @@ impl Ppu {
         // Colonne de l'écran où la window commence. En i16 : avec WX < 7, elle est négative.
         let window_x = self.wx as i16 - 7;
 
+        // Les sprites de la ligne, rangés par priorité : X croissant. Le tri de Rust est
+        // stable : à X égal, ils gardent l'ordre de l'OAM.
+        let mut sprites = if self.lcdc & LCDC_OBJ_ENABLE != 0 { self.scan_oam() } else { Vec::new() };
+        sprites.sort_by_key(|s| s.x);
+
         let start = self.ly as usize * SCREEN_WIDTH;
         for x in 0..SCREEN_WIDTH {
-            let color = if window_shown && x as i16 >= window_x {
+            // ① Le numéro de couleur du fond ou de la window. Fond désactivé : couleur 0.
+            let bg_color = if !bg_enabled {
+                0
+            } else if window_shown && x as i16 >= window_x {
                 self.window_color((x as i16 - window_x) as u8)
             } else {
                 self.background_color(x as u8)
             };
-            // Fond désactivé : blanc, quelle que soit la palette.
-            self.framebuffer[start + x] = if bg_enabled { shade(self.bgp, color) } else { 0 };
+            // ② Le premier sprite, par priorité, qui n'est pas transparent ici.
+            let sprite = sprites.iter().find_map(|s| self.sprite_color(s, x as u8).map(|c| (s, c)));
+            // ③ La teinte : celle du sprite, sauf s'il passe derrière une couleur 1-3 du fond.
+            self.framebuffer[start + x] = match sprite {
+                Some((s, color)) if s.attrs & ATTR_BEHIND_BG == 0 || bg_color == 0 => {
+                    let palette = if s.attrs & ATTR_PALETTE != 0 { self.obp1 } else { self.obp0 };
+                    shade(palette, color)
+                }
+                // Fond désactivé : blanc, quelle que soit la palette.
+                _ => if bg_enabled { shade(self.bgp, bg_color) } else { 0 },
+            };
         }
         if window_shown {
             self.window_line += 1; // la window a été dessinée sur cette ligne
+        }
+    }
+
+    /// Hauteur des sprites, la même pour les 40 : 8 ou 16 lignes selon LCDC bit 2.
+    fn sprite_height(&self) -> u8 {
+        if self.lcdc & LCDC_OBJ_SIZE != 0 { 16 } else { 8 }
+    }
+
+    /// Le scan du mode 2 : les 10 premiers sprites de l'OAM qui croisent la ligne LY.
+    /// Seul Y compte : un sprite caché à gauche (X = 0) prend quand même une place.
+    fn scan_oam(&self) -> Vec<Sprite> {
+        // En u16 : y + 16 dépasse 255 pour les dernières lignes.
+        let line = self.ly as u16 + 16;
+        let height = self.sprite_height() as u16;
+        self.oam
+            .chunks_exact(4)
+            .map(|b| Sprite { y: b[0], x: b[1], tile: b[2], attrs: b[3] })
+            .filter(|s| s.y as u16 <= line && line < s.y as u16 + height)
+            .take(MAX_SPRITES_PER_LINE)
+            .collect()
+    }
+
+    /// Numéro de couleur du sprite au pixel `x` de la ligne LY, ou `None` s'il ne couvre
+    /// pas ce pixel ou s'il y est transparent (couleur 0). Le sprite vient de `scan_oam`.
+    fn sprite_color(&self, sprite: &Sprite, x: u8) -> Option<u8> {
+        // Colonne dans le sprite. On reste en « +8 » : si le sprite commence à droite
+        // de x, la soustraction fait le tour et donne un grand nombre, donc ≥ 8.
+        let mut col = (x + 8).wrapping_sub(sprite.x);
+        if col >= 8 {
+            return None;
+        }
+        // Ligne dans le sprite : le scan garantit 0 ≤ row < hauteur.
+        let height = self.sprite_height();
+        let mut row = self.ly + 16 - sprite.y;
+
+        if sprite.attrs & ATTR_FLIP_X != 0 {
+            col = 7 - col;
+        }
+        if sprite.attrs & ATTR_FLIP_Y != 0 {
+            row = height - 1 - row; // en 8 × 16, les 16 lignes se retournent d'un bloc
+        }
+        // En 8 × 16, le bit 0 est ignoré : on part toujours de la tuile paire.
+        let tile = if height == 16 { sprite.tile & 0xFE } else { sprite.tile };
+        // Toujours le mode 8000. Les lignes 8 à 15 tombent pile dans la tuile suivante,
+        // rangée juste après (16 octets plus loin).
+        let addr = 0x8000 + tile as u16 * 16 + row as u16 * 2;
+        match self.row_pixel(addr, col) {
+            0 => None, // la couleur 0 d'un sprite est transparente
+            color => Some(color),
         }
     }
 
@@ -273,7 +360,11 @@ impl Ppu {
 
     /// Numéro de couleur du pixel (`col`, `row`) de la tuile `tile`.
     fn tile_pixel(&self, tile: u8, row: u8, col: u8) -> u8 {
-        let addr = self.tile_address(tile) + row as u16 * 2;
+        self.row_pixel(self.tile_address(tile) + row as u16 * 2, col)
+    }
+
+    /// Numéro de couleur du pixel `col` d'une ligne de tuile (2 octets à `addr`).
+    fn row_pixel(&self, addr: u16, col: u8) -> u8 {
         let low = self.vram_read(addr); //      les bits bas des 8 pixels
         let high = self.vram_read(addr + 1); // les bits hauts
         let bit = 7 - col; // le pixel 0 est le bit 7
@@ -699,5 +790,176 @@ mod tests {
         ppu.write(0xFF40, 0x90); // LCDC bit 0 = 0
         ppu.render_line();
         assert!(ppu.framebuffer()[..SCREEN_WIDTH].iter().all(|&s| s == 0));
+    }
+
+    // ---------- Sprites ----------
+
+    /// Écrit la fiche `index` de l'OAM (Y et X bruts, avec leurs +16 et +8).
+    fn put_sprite(ppu: &mut Ppu, index: usize, y: u8, x: u8, tile: u8, attrs: u8) {
+        for (i, value) in [y, x, tile, attrs].into_iter().enumerate() {
+            ppu.write_oam_dma(index * 4 + i, value);
+        }
+    }
+
+    #[test]
+    fn le_scan_garde_les_sprites_qui_croisent_la_ligne() {
+        let mut ppu = Ppu::new();
+        put_sprite(&mut ppu, 0, 16, 8, 1, 0); //  lignes 0 à 7 : oui
+        put_sprite(&mut ppu, 1, 24, 8, 2, 0); //  lignes 8 à 15 : non
+        put_sprite(&mut ppu, 2, 9, 8, 3, 0); //   lignes -7 à 0 : oui, sa dernière ligne
+        put_sprite(&mut ppu, 3, 8, 8, 4, 0); //   lignes -8 à -1 : non
+        let tiles: Vec<u8> = ppu.scan_oam().iter().map(|s| s.tile).collect();
+        assert_eq!(tiles, [1, 3]);
+    }
+
+    #[test]
+    fn le_scan_s_arrete_a_10_sprites() {
+        let mut ppu = Ppu::new();
+        for i in 0..12 {
+            // X = 0 : tous cachés à gauche, mais ils comptent quand même
+            put_sprite(&mut ppu, i, 16, 0, i as u8, 0);
+        }
+        let tiles: Vec<u8> = ppu.scan_oam().iter().map(|s| s.tile).collect();
+        assert_eq!(tiles, (0..10).collect::<Vec<u8>>()); // les 10 premiers de l'OAM
+    }
+
+    #[test]
+    fn en_8x16_un_sprite_couvre_16_lignes() {
+        let mut ppu = Ppu::new();
+        put_sprite(&mut ppu, 0, 8, 8, 0, 0); // lignes -8 à 7
+        assert!(ppu.scan_oam().is_empty()); // en 8 × 8 : lignes -8 à -1, invisible
+        ppu.write(0xFF40, 0x91 | LCDC_OBJ_SIZE);
+        assert_eq!(ppu.scan_oam().len(), 1);
+    }
+
+    /// Tuile 1, ligne 0 : les couleurs 3, 2, 1, puis 0 sur le reste de la ligne.
+    fn sprite_test_ppu() -> Ppu {
+        let mut ppu = Ppu::new();
+        ppu.write(0x8010, 0xA0); // bits bas :  1 0 1 0 0 0 0 0
+        ppu.write(0x8011, 0xC0); // bits hauts : 1 1 0 0 0 0 0 0
+        ppu
+    }
+
+    /// Les couleurs du sprite sur les colonnes `xs` de la ligne LY.
+    fn sprite_colors(ppu: &Ppu, xs: std::ops::Range<u8>) -> Vec<Option<u8>> {
+        let sprite = ppu.scan_oam()[0];
+        xs.map(|x| ppu.sprite_color(&sprite, x)).collect()
+    }
+
+    #[test]
+    fn un_sprite_couvre_8_colonnes_a_partir_de_x_moins_8() {
+        let mut ppu = sprite_test_ppu();
+        put_sprite(&mut ppu, 0, 16, 18, 1, 0); // colonnes 10 à 17
+        assert_eq!(
+            sprite_colors(&ppu, 9..19),
+            [None, Some(3), Some(2), Some(1), None, None, None, None, None, None]
+        ); //  ↑ x = 9 : avant le sprite     ↑ couleur 0 : transparent   ↑ x = 18 : après
+    }
+
+    #[test]
+    fn un_sprite_a_moitie_cache_a_gauche() {
+        let mut ppu = sprite_test_ppu();
+        put_sprite(&mut ppu, 0, 16, 6, 1, 0); // colonnes -2 à 5
+        assert_eq!(sprite_colors(&ppu, 0..2), [Some(1), None]); // ses colonnes 2 et 3
+    }
+
+    #[test]
+    fn le_miroir_x_lit_la_ligne_a_l_envers() {
+        let mut ppu = sprite_test_ppu();
+        put_sprite(&mut ppu, 0, 16, 8, 1, ATTR_FLIP_X);
+        assert_eq!(sprite_colors(&ppu, 5..8), [Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn les_sprites_ignorent_le_mode_8800() {
+        let mut ppu = sprite_test_ppu();
+        ppu.write(0xFF40, 0x81); // LCDC bit 4 = 0 : le fond passe en mode 8800
+        put_sprite(&mut ppu, 0, 16, 8, 1, 0);
+        assert_eq!(sprite_colors(&ppu, 0..1), [Some(3)]); // toujours lu en 0x8010
+    }
+
+    #[test]
+    fn en_8x16_le_miroir_y_retourne_les_deux_tuiles() {
+        let mut ppu = Ppu::new();
+        ppu.write(0x8020, 0x80); // tuile 2, ligne 0 : pixel 0 de couleur 3
+        ppu.write(0x8021, 0x80);
+        ppu.write(0x803E, 0x80); // tuile 3, ligne 7 : pixel 0 de couleur 1
+        ppu.write(0xFF40, 0x91 | LCDC_OBJ_SIZE);
+        // Numéro 3 : le bit 0 est ignoré, le sprite commence à la tuile 2.
+        put_sprite(&mut ppu, 0, 16, 8, 3, 0);
+        assert_eq!(sprite_colors(&ppu, 0..1), [Some(3)]); // LY 0 = haut de la tuile 2
+        put_sprite(&mut ppu, 0, 16, 8, 3, ATTR_FLIP_Y);
+        assert_eq!(sprite_colors(&ppu, 0..1), [Some(1)]); // LY 0 = bas de la tuile 3
+    }
+
+    const LCDC_WITH_SPRITES: u8 = 0x93; // écran, mode 8000, fond et sprites
+
+    /// Tuile 1 : 3, 2, 1, 0… (comme plus haut). Tuile 2 : une ligne pleine de couleur 1.
+    /// OBP0 = 0xE4 : chaque couleur garde sa teinte (0→0, 1→1, 2→2, 3→3).
+    fn priority_test_ppu() -> Ppu {
+        let mut ppu = sprite_test_ppu();
+        ppu.write(0x8020, 0xFF);
+        ppu.write(0xFF40, LCDC_WITH_SPRITES);
+        ppu.write(0xFF48, 0xE4);
+        ppu
+    }
+
+    fn first_pixels(ppu: &mut Ppu) -> &[u8] {
+        ppu.render_line(); // la ligne 0
+        &ppu.framebuffer()[..8]
+    }
+
+    #[test]
+    fn lcdc_bit_1_cache_les_sprites() {
+        let mut ppu = priority_test_ppu();
+        put_sprite(&mut ppu, 0, 16, 8, 2, 0);
+        assert_eq!(first_pixels(&mut ppu)[0], 1);
+        ppu.write(0xFF40, LCDC_WITH_SPRITES & !LCDC_OBJ_ENABLE);
+        assert_eq!(first_pixels(&mut ppu)[0], 0);
+    }
+
+    #[test]
+    fn le_plus_petit_x_passe_devant() {
+        let mut ppu = priority_test_ppu();
+        put_sprite(&mut ppu, 0, 16, 9, 2, 0); // B : colonnes 1 à 8, OAM #0
+        put_sprite(&mut ppu, 1, 16, 8, 1, 0); // A : colonnes 0 à 7, OAM #1
+        // A devant ; à x = 3, A est transparent (couleur 0) : on voit B.
+        assert_eq!(first_pixels(&mut ppu)[..4], [3, 2, 1, 1]);
+    }
+
+    #[test]
+    fn a_x_egal_l_ordre_de_l_oam_decide() {
+        let mut ppu = priority_test_ppu();
+        put_sprite(&mut ppu, 0, 16, 8, 2, 0); // OAM #0 : devant
+        put_sprite(&mut ppu, 1, 16, 8, 1, 0);
+        assert_eq!(first_pixels(&mut ppu)[..4], [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn obp1_avec_le_bit_4() {
+        let mut ppu = priority_test_ppu();
+        ppu.write(0xFF49, 0x1B); // OBP1 inversée : la couleur 1 donne la teinte 2
+        put_sprite(&mut ppu, 0, 16, 8, 2, ATTR_PALETTE);
+        assert_eq!(first_pixels(&mut ppu)[0], 2);
+    }
+
+    #[test]
+    fn derriere_le_fond_seulement_sur_ses_couleurs_1_a_3() {
+        let mut ppu = priority_test_ppu();
+        ppu.write(0x8000, 0x0F); // fond (tuile 0), ligne 0 : couleur 0 puis 4 × couleur 1
+        put_sprite(&mut ppu, 0, 16, 8, 2, 0);
+        assert_eq!(first_pixels(&mut ppu), [1, 1, 1, 1, 1, 1, 1, 1]); // devant
+        put_sprite(&mut ppu, 0, 16, 8, 2, ATTR_BEHIND_BG);
+        // BGP = 0xFC : la couleur 1 du fond donne la teinte 3.
+        assert_eq!(first_pixels(&mut ppu), [1, 1, 1, 1, 3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn fond_desactive_les_sprites_restent_devant() {
+        let mut ppu = priority_test_ppu();
+        ppu.write(0x8000, 0xFF); // le fond aurait la couleur 1 partout
+        ppu.write(0xFF40, LCDC_WITH_SPRITES & !LCDC_BG_ENABLE);
+        put_sprite(&mut ppu, 0, 16, 8, 1, ATTR_BEHIND_BG);
+        assert_eq!(first_pixels(&mut ppu)[..4], [3, 2, 1, 0]);
     }
 }
